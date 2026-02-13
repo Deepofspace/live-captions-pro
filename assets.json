@@ -1,0 +1,9 @@
+{
+  "copy_to_app": [
+    "app.ico",
+    "banner_api.png",
+    "banner_caption.png",
+    "banner_controls.png",
+    "banner_stats.png"
+  ]
+}

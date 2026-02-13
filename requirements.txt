@@ -1,0 +1,8 @@
+# Core
+requests>=2.31.0
+numpy>=1.26.0
+sounddevice>=0.4.6
+cryptography>=41.0.0
+
+# UI assets (banners/icons). If you don't use banners you can remove Pillow.
+Pillow>=10.0.0
