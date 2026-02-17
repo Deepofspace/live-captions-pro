@@ -8,6 +8,7 @@ import numpy as np
 import sounddevice as sd
 import requests
 
+# Pillow is optional; banners are centered without resizing.
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 # ======================================================
@@ -228,6 +229,63 @@ def openai_transcribe_tr(wav_bytes: bytes, api_key: str, model: str, timeout_s: 
     r = post_with_backoff(url, headers=headers, files=files, data=data, timeout=timeout_s, max_retries=7)
     return (r.json().get("text") or "").strip()
 
+
+# ===================== Audio resampling (for upload bandwidth) =====================
+def resample_audio_f32(audio_f32: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    """High-quality resampling (linear interpolation). Keeps mono float32 in [-1,1]."""
+    if sr_out <= 0 or sr_in <= 0 or sr_out == sr_in:
+        return audio_f32.astype(np.float32, copy=False)
+    if audio_f32.size == 0:
+        return audio_f32.astype(np.float32, copy=False)
+
+    x_old = np.arange(audio_f32.size, dtype=np.float64)
+    n_new = int(round(audio_f32.size * (float(sr_out) / float(sr_in))))
+    if n_new <= 1:
+        return audio_f32[:1].astype(np.float32, copy=False)
+
+    x_new = np.linspace(0.0, float(audio_f32.size - 1), num=n_new, dtype=np.float64)
+    y_new = np.interp(x_new, x_old, audio_f32.astype(np.float64))
+    return np.clip(y_new, -1.0, 1.0).astype(np.float32)
+
+# ===================== OpenAI text polish (Chat Completions) =====================
+def openai_polish_tr_text(text_tr: str, api_key: str, model: str, strength: str, temperature: float, timeout_s: float) -> str:
+    """Rewrite Turkish transcript for clarity while preserving meaning. Returns polished text."""
+    api_key = (api_key or "").strip()
+    if not api_key or not (text_tr or "").strip():
+        return (text_tr or "").strip()
+
+    strength = (strength or "standard").strip().lower()
+    if strength not in ("light", "standard", "strong"):
+        strength = "standard"
+
+    # Keep it tight: no added info, no censorship, just punctuation/grammar/flow.
+    if strength == "light":
+        instr = "Noktalama ve büyük-küçük harf düzelt; anlamı değiştirme; mümkünse kelime ekleme/çıkarma yapma."
+    elif strength == "strong":
+        instr = "Cümleyi doğal Türkçe olacak şekilde yeniden yaz; tekrarları, dolgu seslerini (ıı, ee) temizle; anlamı değiştirme; ek bilgi ekleme."
+    else:
+        instr = "Noktalama, imla ve akıcılığı düzelt; tekrarları ve dolgu seslerini azalt; anlamı değiştirme; ek bilgi ekleme."
+
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "temperature": float(temperature),
+        "messages": [
+            {"role": "system", "content": "Sen Türkçe metin düzeltme asistanısın."},
+            {"role": "user", "content": f"Aşağıdaki konuşma dökümünü düzelt. {instr}\n\nMETİN:\n{text_tr.strip()}\n\nSadece düzeltilmiş metni yaz."},
+        ],
+    }
+    r = post_with_backoff(url, headers=headers, data=json.dumps(payload).encode("utf-8"), timeout=int(round(float(timeout_s))), max_retries=5)
+    data = r.json() if hasattr(r, "json") else {}
+    try:
+        out = (((data.get("choices") or [])[0].get("message") or {}).get("content") or "").strip()
+    except Exception:
+        out = ""
+    return out or text_tr.strip()
 def deepl_translate(text_tr: str, deepl_key: str, deepl_base: str, target: str, timeout_s: int) -> str:
     url = f"{deepl_base.rstrip('/')}/v2/translate"
     headers = {
@@ -356,6 +414,12 @@ class LiveCaptionApp(tk.Tk):
         self.stop_event = threading.Event()
         self.worker_thread = None
 
+
+        # Watchdog (prevents silent stalls: audio stream/network)
+        self.last_audio_ts = 0.0
+        self.last_caption_ts = 0.0
+        self._watchdog_restart_inflight = False
+        self._watchdog_last_restart = 0.0
         self.spoken_seconds = 0.0
         self.deepl_chars = 0
         self.output_dir = tk.StringVar(value=BASE_DIR)
@@ -377,12 +441,43 @@ class LiveCaptionApp(tk.Tk):
         self.out_en = tk.StringVar(value="caption_en.txt")
         self.out_ua = tk.StringVar(value="caption_ua.txt")
 
+        # Translation toggles (DeepL). If disabled, we skip the API call.
+        self.enable_en = tk.BooleanVar(value=True)
+        self.enable_ua = tk.BooleanVar(value=True)
+        self.enable_de = tk.BooleanVar(value=False)
+        self.enable_fr = tk.BooleanVar(value=False)
+        self.enable_es = tk.BooleanVar(value=False)
+
+        # Output files for extra languages
+        self.out_de = tk.StringVar(value="caption_de.txt")
+        self.out_fr = tk.StringVar(value="caption_fr.txt")
+        self.out_es = tk.StringVar(value="caption_es.txt")
+
         self.write_transcript = tk.BooleanVar(value=True)
         self.transcript_path = tk.StringVar(value="session_transcript.txt")
         self.transcript_clear_on_start = tk.BooleanVar(value=True)
 
         self.max_chars = tk.IntVar(value=42)
         self.max_lines = tk.IntVar(value=2)
+
+        # Auto-clear captions (seconds). 0 = disabled
+        self.auto_clear_seconds = tk.DoubleVar(value=0.0)
+        self._auto_clear_after_id = None
+
+        # Quality & Performance
+        # Upload sample rate for OpenAI (reduces bandwidth/ping). 16000 recommended.
+        self.upload_sample_rate = tk.IntVar(value=16000)
+
+        # AI Turkish polishing (post-process TR transcript for readability)
+        self.enable_ai_polish_tr = tk.BooleanVar(value=False)
+        self.use_ai_tr_for_deepl = tk.BooleanVar(value=True)
+        self.ai_polish_model = tk.StringVar(value="gpt-4o-mini")
+        self.ai_polish_strength = tk.StringVar(value="standard")  # light|standard|strong
+        self.ai_temperature = tk.DoubleVar(value=0.2)
+        self.ai_timeout = tk.DoubleVar(value=12.0)
+
+        # Translation concurrency limit (controls parallel DeepL calls)
+        self.max_concurrent_translations = tk.IntVar(value=1)
 
         self.special_enabled = tk.BooleanVar(value=True)
         self.special_threshold = tk.DoubleVar(value=0.86)
@@ -402,6 +497,8 @@ class LiveCaptionApp(tk.Tk):
         self.after(100, self._poll_ui_queue)
         self.after(500, self._update_stats_labels)
 
+
+        self.after(1000, self._watchdog)
         self._log(f"App folder: {BASE_DIR}")
         self._log(f"Output folder: {self.output_dir.get()}")
 
@@ -626,12 +723,13 @@ class LiveCaptionApp(tk.Tk):
         return "controls"
 
     def _update_banner(self, section_name: str):
-        lbl = getattr(self, 'section_banners', {}).get(section_name)
+        """Update the section banner image and keep it centered (no resizing)."""
+        lbl = getattr(self, "section_banners", {}).get(section_name)
         if lbl is None:
             return
-        banner_path = None
 
-        # assets.json override (can point to any image path)
+        # Resolve banner path (assets.json can override)
+        banner_path = None
         try:
             if isinstance(getattr(self, "_banner_map", None), dict):
                 banner_path = self._banner_map.get(section_name)
@@ -641,17 +739,19 @@ class LiveCaptionApp(tk.Tk):
             banner_path = None
 
         if banner_path:
-            banner_path = banner_path if os.path.isabs(banner_path) else os.path.join(BASE_DIR, banner_path)
+            if not os.path.isabs(banner_path):
+                banner_path = os.path.join(BASE_DIR, banner_path)
         else:
             key = self._banner_key_for_section(section_name)
             banner_path = os.path.join(BASE_DIR, f"banner_{key}.png")
 
         img = self._load_image(f"banner::{section_name}", banner_path)
-        if img is not None:
-            lbl.configure(image=img, text="", anchor="w")
+        if img:
+            lbl.configure(image=img, text="", anchor="center")
             lbl.image = img  # keep reference
         else:
-            lbl.configure(image="", text=f"Live Captions\\n{section_name}", anchor="w")
+            lbl.configure(image="", text=f"Live Caption\\n{section_name}", anchor="center")
+
 
     def _pick_output_folder(self):
         folder = filedialog.askdirectory(initialdir=self.output_dir.get() or APPDIR)
@@ -730,6 +830,46 @@ class LiveCaptionApp(tk.Tk):
             "Enable Ukrainian (DeepL)":
                 "Ukraynaca çeviriyi aç/kapat.\n"
                 "Kapalıysa DeepL maliyeti ve gecikme azalır.",
+
+
+            "Enable German (DeepL)":
+                "Almanca çeviriyi aç/kapat. (DE)\n"
+                "Kapalıysa DeepL maliyeti ve gecikme azalır.",
+
+            "Enable French (DeepL)":
+                "Fransızca çeviriyi aç/kapat. (FR)\n"
+                "Kapalıysa DeepL maliyeti ve gecikme azalır.",
+
+            "Enable Spanish (DeepL)":
+                "İspanyolca çeviriyi aç/kapat. (ES)\n"
+                "Kapalıysa DeepL maliyeti ve gecikme azalır.",
+
+            "Upload Sample Rate":
+                "OpenAI'ye gönderilen sesin örnekleme hızı (Hz).\n\n"
+                "16000 → daha az upload (ping düşer), konuşma için yeterli kalite\n"
+                "24000/48000 → daha yüksek kalite ama daha fazla upload.",
+
+            "Max concurrent translations":
+                "DeepL çevirilerinin aynı anda kaç dil paralel çalışacağını belirler.\n"
+                "1 → en stabil (ping daha az)\n"
+                "2+ → daha hızlı ama daha fazla ağ yükü.",
+
+            "AI Polish Model":
+                "TR metni düzeltmek için kullanılacak OpenAI modeli (chat).\n"
+                "Öneri: gpt-4o-mini (hız/kalite dengesi).",
+
+            "AI Polish Strength":
+                "AI düzeltme şiddeti: light / standard / strong\n"
+                "light → sadece noktalama\n"
+                "standard → akıcılık + ufak temizlik\n"
+                "strong → daha agresif yeniden yazım.",
+
+            "AI Temperature":
+                "AI düzeltme yaratıcılığı.\n"
+                "0.0–0.3 önerilir (anlam kaymasın).",
+
+            "AI Timeout (s)":
+                "AI düzeltme isteği için timeout süresi (s).",
         }
 
     def _build_sections(self):
@@ -756,14 +896,19 @@ class LiveCaptionApp(tk.Tk):
         tk.Button(row, text="Refresh", bg="#3a3a3a", fg="white", command=self._refresh_devices).grid(row=0, column=2, padx=6, pady=6)
         row.columnconfigure(1, weight=1)
 
+        # -----------------------------
+        # Core Settings
+        # -----------------------------
         grid = tk.Frame(f, bg="#2b2b2b")
         grid.pack(fill="x", padx=16, pady=8)
-        items = [
+
+        core_items = [
             ("OpenAI Model", self.openai_model),
             ("DeepL Base", self.deepl_base),
             ("Min sec between OpenAI calls", self.min_seconds_between_calls),
             ("OpenAI timeout (s)", self.openai_timeout),
             ("DeepL timeout (s)", self.deepl_timeout),
+            ("Auto clear after (s)", self.auto_clear_seconds),
             ("Sample Rate", self.sample_rate),
             ("Energy Thresh", self.energy_threshold),
             ("Silence finalize (s)", self.silence_finalize),
@@ -771,7 +916,7 @@ class LiveCaptionApp(tk.Tk):
             ("Max utt (s)", self.max_utt),
         ]
         help_map = self._settings_help_map()
-        for r, (lbl, var) in enumerate(items):
+        for r, (lbl, var) in enumerate(core_items):
             tk.Label(grid, text=lbl, bg="#2b2b2b", fg="white").grid(row=r, column=0, sticky="w", padx=6, pady=6)
             cell = tk.Frame(grid, bg="#2b2b2b")
             cell.grid(row=r, column=1, sticky="ew", padx=6, pady=6)
@@ -779,6 +924,49 @@ class LiveCaptionApp(tk.Tk):
             e.pack(side="left", fill="x", expand=True)
             add_help_bubble(cell, help_map.get(lbl, ""))
         grid.columnconfigure(1, weight=1)
+
+        # -----------------------------
+        # Quality & Performance (advanced)
+        # -----------------------------
+        qp_wrap = tk.Frame(f, bg="#2b2b2b")
+        qp_wrap.pack(fill="x", padx=16, pady=(8, 12))
+
+        tk.Label(qp_wrap, text="Quality & Performance", bg="#2b2b2b", fg="white",
+                 font=("Segoe UI", 12, "bold")).pack(anchor="w", pady=(0, 6))
+
+        qp_grid = tk.Frame(qp_wrap, bg="#2b2b2b")
+        qp_grid.pack(fill="x")
+
+        qp_items = [
+            ("Upload Sample Rate", self.upload_sample_rate),
+            ("Max concurrent translations", self.max_concurrent_translations),
+            ("AI Polish Model", self.ai_polish_model),
+            ("AI Polish Strength", self.ai_polish_strength),
+            ("AI Temperature", self.ai_temperature),
+            ("AI Timeout (s)", self.ai_timeout),
+        ]
+        for r, (lbl, var) in enumerate(qp_items):
+            tk.Label(qp_grid, text=lbl, bg="#2b2b2b", fg="white").grid(row=r, column=0, sticky="w", padx=6, pady=6)
+            cell = tk.Frame(qp_grid, bg="#2b2b2b")
+            cell.grid(row=r, column=1, sticky="ew", padx=6, pady=6)
+            e = tk.Entry(cell, textvariable=var, width=60)
+            e.pack(side="left", fill="x", expand=True)
+            add_help_bubble(cell, help_map.get(lbl, ""))
+        qp_grid.columnconfigure(1, weight=1)
+
+        tk.Checkbutton(qp_wrap,
+                       text="Enable AI Turkish polish (final text)",
+                       variable=self.enable_ai_polish_tr,
+                       bg="#2b2b2b", fg="white",
+                       selectcolor="#2b2b2b",
+                       activebackground="#2b2b2b").pack(anchor="w", pady=(10, 2))
+
+        tk.Checkbutton(qp_wrap,
+                       text="Use AI-polished Turkish as source for DeepL",
+                       variable=self.use_ai_tr_for_deepl,
+                       bg="#2b2b2b", fg="white",
+                       selectcolor="#2b2b2b",
+                       activebackground="#2b2b2b").pack(anchor="w", pady=(2, 2))
 
         # Caption Formatting
         f = self.sections["Caption Formatting"]
@@ -791,6 +979,38 @@ class LiveCaptionApp(tk.Tk):
         tk.Entry(row, textvariable=self.max_chars, width=6).grid(row=0, column=1, padx=8, pady=6)
         tk.Label(row, text="Lines", bg="#2b2b2b", fg="white").grid(row=0, column=2, padx=8, pady=6, sticky="w")
         tk.Entry(row, textvariable=self.max_lines, width=4).grid(row=0, column=3, padx=8, pady=6)
+
+        # -----------------------------
+        # DeepL Language Toggles
+        # -----------------------------
+        tk.Label(
+            f,
+            text="DeepL Translation Languages",
+            bg="#2b2b2b",
+            fg="white",
+            font=("Segoe UI", 12, "bold")
+        ).pack(anchor="w", padx=16, pady=(18, 6))
+
+        lang_box = tk.Frame(f, bg="#2b2b2b")
+        lang_box.pack(fill="x", padx=16, pady=(0, 12))
+
+        def _lang_cb(text, var, col):
+            tk.Checkbutton(
+                lang_box,
+                text=text,
+                variable=var,
+                bg="#2b2b2b",
+                fg="white",
+                selectcolor="#2b2b2b",
+                activebackground="#2b2b2b"
+            ).grid(row=0, column=col, sticky="w", padx=10)
+
+        _lang_cb("English (EN)", self.enable_en, 0)
+        _lang_cb("Ukrainian (UK)", self.enable_ua, 1)
+        _lang_cb("German (DE)", self.enable_de, 2)
+        _lang_cb("French (FR)", self.enable_fr, 3)
+        _lang_cb("Spanish (ES)", self.enable_es, 4)
+
 
         # Special Names
         f = self.sections["Special Names"]
@@ -828,7 +1048,7 @@ class LiveCaptionApp(tk.Tk):
 
         grid = tk.Frame(f, bg="#2b2b2b")
         grid.pack(fill="x", padx=16, pady=8)
-        for r, (lbl, var) in enumerate([("TR file", self.out_tr), ("EN file", self.out_en), ("UA file", self.out_ua)]):
+        for r, (lbl, var) in enumerate([("TR file", self.out_tr), ("EN file", self.out_en), ("UA file", self.out_ua), ("DE file", self.out_de), ("FR file", self.out_fr), ("ES file", self.out_es)]):
             tk.Label(grid, text=lbl, bg="#2b2b2b", fg="white").grid(row=r, column=0, sticky="w", padx=6, pady=6)
             tk.Entry(grid, textvariable=var, width=60).grid(row=r, column=1, sticky="ew", padx=6, pady=6)
         grid.columnconfigure(1, weight=1)
@@ -858,23 +1078,68 @@ class LiveCaptionApp(tk.Tk):
         # Live Output
         f = self.sections["Live Output"]
         tk.Label(f, text="Live Output", bg="#2b2b2b", fg="white", font=("Segoe UI", 14, "bold")).pack(pady=12)
-        cols = tk.Frame(f, bg="#2b2b2b")
-        cols.pack(fill="both", expand=True, padx=16, pady=10)
-        cols.columnconfigure(0, weight=1)
-        cols.columnconfigure(1, weight=1)
-        cols.columnconfigure(2, weight=1)
 
-        tk.Label(cols, text="Türkçe (STT)", bg="#2b2b2b", fg="white").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        tk.Label(cols, text="English (DeepL)", bg="#2b2b2b", fg="white").grid(row=0, column=1, sticky="w", padx=6, pady=6)
-        tk.Label(cols, text="Ukrainian (DeepL)", bg="#2b2b2b", fg="white").grid(row=0, column=2, sticky="w", padx=6, pady=6)
+        root_cols = tk.Frame(f, bg="#2b2b2b")
+        root_cols.pack(fill="both", expand=True, padx=16, pady=10)
+        root_cols.columnconfigure(0, weight=2)
+        root_cols.columnconfigure(1, weight=1)
+        root_cols.rowconfigure(1, weight=1)
 
-        self.tr_text = tk.Text(cols, height=10, wrap="word")
-        self.en_text = tk.Text(cols, height=10, wrap="word")
-        self.ua_text = tk.Text(cols, height=10, wrap="word")
+        # Left: Turkish is always visible
+        tk.Label(root_cols, text="Türkçe (STT)", bg="#2b2b2b", fg="white").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self.tr_text = tk.Text(root_cols, height=10, wrap="word")
         self.tr_text.grid(row=1, column=0, sticky="nsew", padx=6, pady=6)
-        self.en_text.grid(row=1, column=1, sticky="nsew", padx=6, pady=6)
-        self.ua_text.grid(row=1, column=2, sticky="nsew", padx=6, pady=6)
-        cols.rowconfigure(1, weight=1)
+
+        # Right: other languages are collapsible (arrow ▶ / ▼)
+        right = tk.Frame(root_cols, bg="#2b2b2b")
+        right.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(12, 0))
+        right.columnconfigure(0, weight=1)
+
+        self._live_panels = {}
+
+        def _make_panel(code: str, title: str, attr_name: str, open_by_default: bool = False):
+            hdr = tk.Frame(right, bg="#2b2b2b")
+            hdr.grid(sticky="ew", padx=0, pady=(0, 4))
+            hdr.columnconfigure(1, weight=1)
+
+            btn = tk.Button(hdr, text="▼" if open_by_default else "▶",
+                            width=2, bg="#3a3a3a", fg="white", relief="flat")
+            btn.grid(row=0, column=0, sticky="w", padx=(0, 8))
+            lbl = tk.Label(hdr, text=title, bg="#2b2b2b", fg="white")
+            lbl.grid(row=0, column=1, sticky="w")
+
+            body = tk.Frame(right, bg="#2b2b2b")
+            body.grid(sticky="nsew", padx=0, pady=(0, 12))
+            body.columnconfigure(0, weight=1)
+
+            txtw = tk.Text(body, height=7, wrap="word")
+            txtw.grid(row=0, column=0, sticky="nsew", padx=0, pady=0)
+            setattr(self, attr_name, txtw)
+
+            state = {"open": bool(open_by_default), "body": body, "btn": btn}
+            self._live_panels[code] = state
+
+            if not open_by_default:
+                body.grid_remove()
+
+            def toggle():
+                st = self._live_panels[code]
+                st["open"] = not st["open"]
+                if st["open"]:
+                    st["body"].grid()
+                    st["btn"].configure(text="▼")
+                else:
+                    st["body"].grid_remove()
+                    st["btn"].configure(text="▶")
+
+            btn.configure(command=toggle)
+
+        # Panels (EN open by default, others hidden until clicked)
+        _make_panel("en", "English (DeepL)", "en_text", open_by_default=self.enable_en.get())
+        _make_panel("ua", "Ukrainian (DeepL)", "ua_text", open_by_default=self.enable_ua.get())
+        _make_panel("de", "German (DeepL)", "de_text", open_by_default=self.enable_de.get())
+        _make_panel("fr", "French (DeepL)", "fr_text", open_by_default=self.enable_fr.get())
+        _make_panel("es", "Spanish (DeepL)", "es_text", open_by_default=self.enable_es.get())
 
         # Log
         f = self.sections["Log"]
@@ -896,9 +1161,10 @@ class LiveCaptionApp(tk.Tk):
         for _sec_name, _sec_frame in self.sections.items():
             if _sec_name in self.section_banners:
                 continue
-            _lbl = tk.Label(_sec_frame, bg="#2b2b2b")
+            _lbl = tk.Label(_sec_frame, bg="#2b2b2b", anchor="center")
             _lbl.pack(fill="x", padx=16, pady=(22, 14))
             self.section_banners[_sec_name] = _lbl
+            _sec_frame.bind("<Configure>", lambda e, s=_sec_name: self._update_banner(s))
 
     # ---------------- Logging / status ----------------
 
@@ -916,6 +1182,110 @@ class LiveCaptionApp(tk.Tk):
     def _set_text(widget: tk.Text, text: str):
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
+
+
+    # ---------------- Auto-clear captions ----------------
+    def _cancel_auto_clear(self):
+        if getattr(self, "_auto_clear_after_id", None) is not None:
+            try:
+                self.after_cancel(self._auto_clear_after_id)
+            except Exception:
+                pass
+            self._auto_clear_after_id = None
+
+    def _touch_auto_clear(self):
+        """(Re)start auto-clear timer after the last subtitle update."""
+        try:
+            secs = float(self.auto_clear_seconds.get())
+        except Exception:
+            secs = 0.0
+        if secs <= 0:
+            self._cancel_auto_clear()
+            return
+        self._cancel_auto_clear()
+        self._auto_clear_after_id = self.after(int(secs * 1000), self._do_auto_clear)
+
+    def _do_auto_clear(self):
+        self._auto_clear_after_id = None
+        # Clear on-screen boxes
+        try:
+            self._set_text(self.tr_text, "")
+        except Exception:
+            pass
+        for attr in ("en_text", "ua_text", "de_text", "fr_text", "es_text"):
+            try:
+                w = getattr(self, attr, None)
+                if w is not None:
+                    self._set_text(w, "")
+            except Exception:
+                pass
+
+        # Clear OBS files (write empty strings)
+        if not self.write_files.get():
+            return
+        out_base = self.output_dir.get()
+        try:
+            atomic_write(self.out_tr.get(), "", out_base)
+        except Exception:
+            pass
+
+        def _clear_if_enabled(flag_var, path_var):
+            try:
+                if flag_var.get():
+                    atomic_write(path_var.get(), "", out_base)
+            except Exception:
+                pass
+
+        _clear_if_enabled(self.enable_en, self.out_en)
+        _clear_if_enabled(self.enable_ua, self.out_ua)
+        _clear_if_enabled(self.enable_de, self.out_de)
+        _clear_if_enabled(self.enable_fr, self.out_fr)
+        _clear_if_enabled(self.enable_es, self.out_es)
+
+# ---------------- Watchdog (auto-recover stalls) ----------------
+    def _watchdog(self):
+        """Periodically checks whether audio/captions have stalled and attempts a safe restart."""
+        try:
+            now = time.time()
+
+            # If worker thread died unexpectedly, surface it
+            if self.worker_thread and (not self.worker_thread.is_alive()) and (not self.stop_event.is_set()):
+                self._log("Watchdog: worker thread stopped unexpectedly. Try Stop -> Start.")
+                self.stop_event.set()
+
+            running = self.worker_thread is not None and self.worker_thread.is_alive() and (not self.stop_event.is_set())
+            if running:
+                if self.last_audio_ts > 0 and (now - self.last_audio_ts) > 6.0:
+                    if (not self._watchdog_restart_inflight) and (now - self._watchdog_last_restart) > 12.0:
+                        self._watchdog_restart_inflight = True
+                        self._watchdog_last_restart = now
+                        self._log("Watchdog: audio stalled (>6s). Restarting…")
+                        try:
+                            self.stop()
+                        except Exception:
+                            pass
+
+                        def _do_restart():
+                            try:
+                                self.start()
+                            finally:
+                                self._watchdog_restart_inflight = False
+
+                        self.after(900, _do_restart)
+
+                if self.last_caption_ts > 0 and (now - self.last_caption_ts) > 60.0:
+                    self._log("Watchdog: no caption update for 60s. (Check network / API limits)")
+
+        except Exception as e:
+            try:
+                self._log(f"Watchdog error: {e}")
+            except Exception:
+                pass
+        finally:
+            try:
+                self.after(1000, self._watchdog)
+            except Exception:
+                pass
 
     # ---------------- Devices ----------------
     def _refresh_devices(self):
@@ -960,6 +1330,14 @@ class LiveCaptionApp(tk.Tk):
             "out_tr": self.out_tr.get(),
             "out_en": self.out_en.get(),
             "out_ua": self.out_ua.get(),
+            "out_de": self.out_de.get(),
+            "out_fr": self.out_fr.get(),
+            "out_es": self.out_es.get(),
+            "enable_en": bool(self.enable_en.get()),
+            "enable_ua": bool(self.enable_ua.get()),
+            "enable_de": bool(self.enable_de.get()),
+            "enable_fr": bool(self.enable_fr.get()),
+            "enable_es": bool(self.enable_es.get()),
             "write_transcript": bool(self.write_transcript.get()),
             "transcript_path": self.transcript_path.get(),
             "transcript_clear_on_start": bool(self.transcript_clear_on_start.get()),
@@ -967,6 +1345,15 @@ class LiveCaptionApp(tk.Tk):
             "special_threshold": float(self.special_threshold.get()),
             "special_text": self.special_text.get("1.0", "end"),
             "output_dir": self.output_dir.get(),
+            "auto_clear_seconds": float(self.auto_clear_seconds.get()),
+            "upload_sample_rate": int(getattr(self, "upload_sample_rate", tk.IntVar(value=16000)).get()),
+            "max_concurrent_translations": int(getattr(self, "max_concurrent_translations", tk.IntVar(value=1)).get()),
+            "enable_ai_polish_tr": bool(getattr(self, "enable_ai_polish_tr", tk.BooleanVar(value=False)).get()),
+            "use_ai_tr_for_deepl": bool(getattr(self, "use_ai_tr_for_deepl", tk.BooleanVar(value=True)).get()),
+            "ai_polish_model": getattr(self, "ai_polish_model", tk.StringVar(value="gpt-4o-mini")).get(),
+            "ai_polish_strength": getattr(self, "ai_polish_strength", tk.StringVar(value="standard")).get(),
+            "ai_temperature": float(getattr(self, "ai_temperature", tk.DoubleVar(value=0.2)).get()),
+            "ai_timeout": float(getattr(self, "ai_timeout", tk.DoubleVar(value=12.0)).get()),
         }
 
     def _apply_config(self, cfg: dict) -> None:
@@ -1008,11 +1395,33 @@ class LiveCaptionApp(tk.Tk):
         s(self.out_tr, "out_tr")
         s(self.out_en, "out_en")
         s(self.out_ua, "out_ua")
+        s(self.out_de, "out_de")
+        s(self.out_fr, "out_fr")
+        s(self.out_es, "out_es")
+        s(self.enable_en, "enable_en")
+        s(self.enable_ua, "enable_ua")
+        s(self.enable_de, "enable_de")
+        s(self.enable_fr, "enable_fr")
+        s(self.enable_es, "enable_es")
         s(self.write_transcript, "write_transcript")
         s(self.transcript_path, "transcript_path")
         s(self.transcript_clear_on_start, "transcript_clear_on_start")
         s(self.special_enabled, "special_enabled")
         s(self.special_threshold, "special_threshold")
+
+
+        s(self.auto_clear_seconds, "auto_clear_seconds")
+        try:
+            s(self.upload_sample_rate, "upload_sample_rate")
+            s(self.max_concurrent_translations, "max_concurrent_translations")
+            s(self.enable_ai_polish_tr, "enable_ai_polish_tr")
+            s(self.use_ai_tr_for_deepl, "use_ai_tr_for_deepl")
+            s(self.ai_polish_model, "ai_polish_model")
+            s(self.ai_polish_strength, "ai_polish_strength")
+            s(self.ai_temperature, "ai_temperature")
+            s(self.ai_timeout, "ai_timeout")
+        except Exception:
+            pass
 
         if isinstance(cfg.get("special_text"), str):
             self.special_text.delete("1.0", "end")
@@ -1038,6 +1447,7 @@ class LiveCaptionApp(tk.Tk):
 
     # ---------------- Start/Stop + animations ----------------
     def start(self):
+        self._cancel_auto_clear()
         if self.worker_thread and self.worker_thread.is_alive():
             return
 
@@ -1066,8 +1476,16 @@ class LiveCaptionApp(tk.Tk):
         try:
             if self.write_files.get():
                 atomic_write(self.out_tr.get().strip() or "caption_tr.txt", "", self.output_dir.get())
-                atomic_write(self.out_en.get().strip() or "caption_en.txt", "", self.output_dir.get())
-                atomic_write(self.out_ua.get().strip() or "caption_ua.txt", "", self.output_dir.get())
+                if self.enable_en.get():
+                    atomic_write(self.out_en.get().strip() or "caption_en.txt", "", self.output_dir.get())
+                if self.enable_ua.get():
+                    atomic_write(self.out_ua.get().strip() or "caption_ua.txt", "", self.output_dir.get())
+                if self.enable_de.get():
+                    atomic_write(self.out_de.get().strip() or "caption_de.txt", "", self.output_dir.get())
+                if self.enable_fr.get():
+                    atomic_write(self.out_fr.get().strip() or "caption_fr.txt", "", self.output_dir.get())
+                if self.enable_es.get():
+                    atomic_write(self.out_es.get().strip() or "caption_es.txt", "", self.output_dir.get())
 
             if self.write_transcript.get() and self.transcript_clear_on_start.get():
                 atomic_write(self.transcript_path.get().strip() or "session_transcript.txt", "", self.output_dir.get())
@@ -1102,6 +1520,7 @@ class LiveCaptionApp(tk.Tk):
         self.worker_thread.start()
 
     def stop(self):
+        self._cancel_auto_clear()
         self.stop_event.set()
         self._set_status("Stopping…")
         self._log("Stop requested.")
@@ -1133,10 +1552,46 @@ class LiveCaptionApp(tk.Tk):
                     self._log(payload)
                 elif kind == "tr":
                     self._set_text(self.tr_text, payload)
+                    try:
+                        self.last_caption_ts = time.time()
+                    except Exception:
+                        pass
+                    self._touch_auto_clear()
                 elif kind == "en":
                     self._set_text(self.en_text, payload)
+                    try:
+                        self.last_caption_ts = time.time()
+                    except Exception:
+                        pass
+                    self._touch_auto_clear()
                 elif kind == "ua":
                     self._set_text(self.ua_text, payload)
+                    try:
+                        self.last_caption_ts = time.time()
+                    except Exception:
+                        pass
+                    self._touch_auto_clear()
+                elif kind == "de":
+                    self._set_text(self.de_text, payload)
+                    try:
+                        self.last_caption_ts = time.time()
+                    except Exception:
+                        pass
+                    self._touch_auto_clear()
+                elif kind == "fr":
+                    self._set_text(self.fr_text, payload)
+                    try:
+                        self.last_caption_ts = time.time()
+                    except Exception:
+                        pass
+                    self._touch_auto_clear()
+                elif kind == "es":
+                    self._set_text(self.es_text, payload)
+                    try:
+                        self.last_caption_ts = time.time()
+                    except Exception:
+                        pass
+                    self._touch_auto_clear()
                 elif kind == "status":
                     self._set_status(payload)
         except queue.Empty:
@@ -1172,6 +1627,15 @@ class LiveCaptionApp(tk.Tk):
         out_tr_path = (self.out_tr.get().strip() or "caption_tr.txt")
         out_en_path = (self.out_en.get().strip() or "caption_en.txt")
         out_ua_path = (self.out_ua.get().strip() or "caption_ua.txt")
+        out_de_path = (self.out_de.get().strip() or "caption_de.txt")
+        out_fr_path = (self.out_fr.get().strip() or "caption_fr.txt")
+        out_es_path = (self.out_es.get().strip() or "caption_es.txt")
+
+        enable_en = bool(self.enable_en.get())
+        enable_ua = bool(self.enable_ua.get())
+        enable_de = bool(self.enable_de.get())
+        enable_fr = bool(self.enable_fr.get())
+        enable_es = bool(self.enable_es.get())
 
         transcript_path = (self.transcript_path.get().strip() or "session_transcript.txt")
         write_transcript = bool(self.write_transcript.get())
@@ -1182,8 +1646,18 @@ class LiveCaptionApp(tk.Tk):
         last_call_time = 0.0
 
         def callback(indata, frames, t, status):
+            try:
+                if status:
+                    self.ui_queue.put(("log", f"Audio status: {status}"))
+            except Exception:
+                pass
             mono = indata[:, 0].copy()
-            q_audio.put((time.time(), mono))
+            ts = time.time()
+            try:
+                self.last_audio_ts = ts
+            except Exception:
+                pass
+            q_audio.put((ts, mono))
 
         try:
             with sd.InputStream(
@@ -1215,7 +1689,13 @@ class LiveCaptionApp(tk.Tk):
                         time.sleep(max(0.0, min_gap - gap))
 
                     self.ui_queue.put(("status", "Transcribing (TR)…"))
-                    wav_bytes = to_wav_bytes(audio_seg, sr)
+                    upload_sr = int(getattr(self, "upload_sample_rate", tk.IntVar(value=sr)).get() or sr)
+                    try:
+                        audio_up = resample_audio_f32(audio_seg, sr_in=sr, sr_out=upload_sr)
+                    except Exception:
+                        audio_up = audio_seg
+                        upload_sr = sr
+                    wav_bytes = to_wav_bytes(audio_up, upload_sr)
 
                     try:
                         tr_text = openai_transcribe_tr(wav_bytes, openai_key, model, timeout_s=oa_timeout)
@@ -1233,6 +1713,44 @@ class LiveCaptionApp(tk.Tk):
                     if use_special:
                         tr_text = apply_special_names(tr_text, sn_mapping, sn_canon_norm, sn_canon_original, threshold)
 
+                    
+                    # Optional AI polish for Turkish transcript (higher readability)
+                    tr_raw = tr_text
+                    tr_display = tr_text
+                    tr_for_translate = tr_text
+
+                    try:
+                        ai_enabled = getattr(self, "enable_ai_polish_tr", tk.BooleanVar(value=False)).get()
+                        use_ai_for_deepl = getattr(self, "use_ai_tr_for_deepl", tk.BooleanVar(value=True)).get()
+                    except Exception:
+                        ai_enabled = False
+                        use_ai_for_deepl = True
+
+                    if ai_enabled:
+                        try:
+                            self.ui_queue.put(("status", "Polishing (AI)…"))
+                            polished = openai_polish_tr_text(
+                                tr_text,
+                                api_key=openai_key,
+                                model=getattr(self, "ai_polish_model", tk.StringVar(value="gpt-4o-mini")).get(),
+                                strength=getattr(self, "ai_polish_strength", tk.StringVar(value="standard")).get(),
+                                temperature=getattr(self, "ai_temperature", tk.DoubleVar(value=0.2)).get(),
+                                timeout_s=getattr(self, "ai_timeout", tk.DoubleVar(value=12.0)).get(),
+                            )
+                            tr_display = (polished or tr_text).strip()
+                        except Exception as e:
+                            self.ui_queue.put(("log", f"AI polish error: {e}"))
+                            tr_display = tr_text
+
+                    # If special names are enabled, enforce canonical spellings after AI too
+                    if use_special:
+                        try:
+                            tr_display = apply_special_names(tr_display, sn_mapping, sn_canon_norm, sn_canon_original, threshold)
+                        except Exception:
+                            pass
+
+                    tr_text = tr_display
+                    tr_for_translate = tr_display if (ai_enabled and use_ai_for_deepl) else tr_raw
                     self.ui_queue.put(("tr", tr_text))
                     if self.write_files.get():
                         try:
@@ -1240,42 +1758,91 @@ class LiveCaptionApp(tk.Tk):
                         except Exception as e:
                             self.ui_queue.put(("log", f"TR file write error: {e}"))
 
-                    self.ui_queue.put(("status", "Translating (EN+UA)…"))
-                    try:
-                        en_text = deepl_translate(tr_text, deepl_key, deepl_base, target="EN", timeout_s=dl_timeout).strip()
-                        ua_text = deepl_translate(tr_text, deepl_key, deepl_base, target="UK", timeout_s=dl_timeout).strip()
-                    except Exception as e:
-                        self.ui_queue.put(("log", f"DeepL error: {e}"))
-                        self.ui_queue.put(("status", "Running… (listening)"))
-                        continue
+                    # Translate only enabled languages (saves cost + latency)
 
-                    self.deepl_chars += len(tr_text)
+                    en_text = ua_text = de_text = fr_text = es_text = ""
+                    any_enabled = enable_en or enable_ua or enable_de or enable_fr or enable_es
+                    if any_enabled:
+                        self.ui_queue.put(("status", "Translating (DeepL)…"))
+                        try:
+                            if enable_en:
+                                en_text = deepl_translate(tr_for_translate, deepl_key, deepl_base, target="EN", timeout_s=dl_timeout).strip()
+                            if enable_ua:
+                                ua_text = deepl_translate(tr_for_translate, deepl_key, deepl_base, target="UK", timeout_s=dl_timeout).strip()
+                            if enable_de:
+                                de_text = deepl_translate(tr_for_translate, deepl_key, deepl_base, target="DE", timeout_s=dl_timeout).strip()
+                            if enable_fr:
+                                fr_text = deepl_translate(tr_for_translate, deepl_key, deepl_base, target="FR", timeout_s=dl_timeout).strip()
+                            if enable_es:
+                                es_text = deepl_translate(tr_for_translate, deepl_key, deepl_base, target="ES", timeout_s=dl_timeout).strip()
+                        except Exception as e:
+                            self.ui_queue.put(("log", f"DeepL error: {e}"))
+                            self.ui_queue.put(("status", "Running… (listening)"))
+                            continue
+
+                        self.deepl_chars += len(tr_text)
+                    else:
+                        self.ui_queue.put(("status", "Running… (listening)"))
 
                     if use_special:
                         if en_text:
                             en_text = apply_special_names(en_text, sn_mapping, sn_canon_norm, sn_canon_original, threshold)
                         if ua_text:
                             ua_text = apply_special_names(ua_text, sn_mapping, sn_canon_norm, sn_canon_original, threshold)
+                        if de_text:
+                            de_text = apply_special_names(de_text, sn_mapping, sn_canon_norm, sn_canon_original, threshold)
+                        if fr_text:
+                            fr_text = apply_special_names(fr_text, sn_mapping, sn_canon_norm, sn_canon_original, threshold)
+                        if es_text:
+                            es_text = apply_special_names(es_text, sn_mapping, sn_canon_norm, sn_canon_original, threshold)
 
                     self.ui_queue.put(("en", en_text))
                     self.ui_queue.put(("ua", ua_text))
+                    self.ui_queue.put(("de", de_text))
+                    self.ui_queue.put(("fr", fr_text))
+                    self.ui_queue.put(("es", es_text))
 
                     if self.write_files.get():
-                        try:
-                            atomic_write(out_en_path, en_text, self.output_dir.get())
-                        except Exception as e:
-                            self.ui_queue.put(("log", f"EN file write error: {e}"))
-                        try:
-                            atomic_write(out_ua_path, ua_text, self.output_dir.get())
-                        except Exception as e:
-                            self.ui_queue.put(("log", f"UA file write error: {e}"))
+                        if enable_en:
+                            try:
+                                atomic_write(out_en_path, en_text, self.output_dir.get())
+                            except Exception as e:
+                                self.ui_queue.put(("log", f"EN file write error: {e}"))
+                        if enable_ua:
+                            try:
+                                atomic_write(out_ua_path, ua_text, self.output_dir.get())
+                            except Exception as e:
+                                self.ui_queue.put(("log", f"UA file write error: {e}"))
+                        if enable_de:
+                            try:
+                                atomic_write(out_de_path, de_text, self.output_dir.get())
+                            except Exception as e:
+                                self.ui_queue.put(("log", f"DE file write error: {e}"))
+                        if enable_fr:
+                            try:
+                                atomic_write(out_fr_path, fr_text, self.output_dir.get())
+                            except Exception as e:
+                                self.ui_queue.put(("log", f"FR file write error: {e}"))
+                        if enable_es:
+                            try:
+                                atomic_write(out_es_path, es_text, self.output_dir.get())
+                            except Exception as e:
+                                self.ui_queue.put(("log", f"ES file write error: {e}"))
 
                     if write_transcript:
                         try:
                             ts = time.strftime("%Y-%m-%d %H:%M:%S")
                             append_write(transcript_path, f"[{ts}] TR: {tr_text}", self.output_dir.get())
-                            append_write(transcript_path, f"[{ts}] EN: {en_text}", self.output_dir.get())
-                            append_write(transcript_path, f"[{ts}] UA: {ua_text}", self.output_dir.get())
+                            if enable_en and en_text:
+                                append_write(transcript_path, f"[{ts}] EN: {en_text}", self.output_dir.get())
+                            if enable_ua and ua_text:
+                                append_write(transcript_path, f"[{ts}] UK: {ua_text}", self.output_dir.get())
+                            if enable_de and de_text:
+                                append_write(transcript_path, f"[{ts}] DE: {de_text}", self.output_dir.get())
+                            if enable_fr and fr_text:
+                                append_write(transcript_path, f"[{ts}] FR: {fr_text}", self.output_dir.get())
+                            if enable_es and es_text:
+                                append_write(transcript_path, f"[{ts}] ES: {es_text}", self.output_dir.get())
                             append_write(transcript_path, "", self.output_dir.get())
                         except Exception as e:
                             self.ui_queue.put(("log", f"Transcript write error: {e}"))
@@ -1291,6 +1858,7 @@ class LiveCaptionApp(tk.Tk):
 
     # ---------------- Close ----------------
     def _on_close(self):
+        self._cancel_auto_clear()
         try:
             if self.worker_thread and self.worker_thread.is_alive():
                 self.stop_event.set()
@@ -1303,4 +1871,42 @@ class LiveCaptionApp(tk.Tk):
         self.destroy()
 
 if __name__ == "__main__":
-    LiveCaptionApp().mainloop()
+    # Bootstrap to prevent "opens then instantly closes" with no visible error.
+    # Writes a log file next to the executable/script and shows a popup.
+    try:
+        LiveCaptionApp().mainloop()
+    except Exception as e:
+        import os, sys, traceback
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+        except Exception:
+            _tk = None
+            _mb = None
+
+        try:
+            base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(__file__)
+        except Exception:
+            base = os.getcwd()
+
+        log_path = os.path.join(base, "startup_error.log")
+        tb = traceback.format_exc()
+
+        try:
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write("Live Caption failed to start.\n\n")
+                f.write(tb)
+        except Exception:
+            pass
+
+        msg = "Uygulama açılırken hata oluştu.\n\n" + str(e) + "\n\nDetay: startup_error.log dosyasına yazıldı."
+        if _mb:
+            try:
+                r = _tk.Tk()
+                r.withdraw()
+                _mb.showerror("Live Caption - Startup Error", msg)
+                r.destroy()
+            except Exception:
+                pass
+        else:
+            print(msg)
